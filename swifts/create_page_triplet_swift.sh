@@ -2,17 +2,123 @@
 
 set -euo pipefail
 
-if [[ $# -lt 1 ]]; then
-  echo "用法: ./create_page_triplet_swift.sh <relative_dir>"
-  exit 1
+EXIT_INVALID_USAGE=2
+EXIT_INVALID_TARGET=3
+EXIT_FILE_EXISTS=4
+
+# AI-friendly contract:
+# - Input: relative_dir (required)
+# - Output files: logic.swift/state.swift/view.swift/model.swift/service.swift/repository.swift
+# - Idempotency: fail when any target file exists unless --force is specified
+
+print_usage() {
+  cat <<'EOF'
+用法:
+  ./create_page_triplet_swift.sh [--dry-run] [--json] [--force] <relative_dir>
+
+参数:
+  --dry-run    只打印将要创建的文件，不落盘
+  --json       输出机器可读 JSON（便于 AI 工具解析）
+  --force      允许覆盖已存在文件
+  -h, --help   显示帮助
+
+示例:
+  ./create_page_triplet_swift.sh ios/pages/order_detail
+  ./create_page_triplet_swift.sh --dry-run ios/pages/order_detail
+  ./create_page_triplet_swift.sh --json --force ios/pages/order_detail
+EOF
+}
+
+json_escape() {
+  local input="$1"
+  INPUT="$input" python3 - <<'PY'
+import json
+import os
+
+print(json.dumps(os.environ["INPUT"]))
+PY
+}
+
+emit_error() {
+  local code="$1"
+  local message="$2"
+  if [[ "$json_output" == "true" ]]; then
+    printf '{"status":"error","code":%s,"message":%s}\n' "$code" "$(json_escape "$message")"
+  else
+    echo "$message"
+  fi
+  exit "$code"
+}
+
+emit_success() {
+  local status_text="$1"
+  local escaped_target
+  escaped_target="$(json_escape "$target_dir")"
+
+  if [[ "$json_output" == "true" ]]; then
+    local file_list_json
+    file_list_json="[$(printf '%s\n' "${files[@]}" | while IFS= read -r item; do json_escape "$item"; done | paste -sd ',' -)]"
+    printf '{"status":%s,"target_dir":%s,"created_files":%s}\n' "$(json_escape "$status_text")" "$escaped_target" "$file_list_json"
+  else
+    for file in "${files[@]}"; do
+      if [[ "$status_text" == "dry-run" ]]; then
+        echo "将创建: $file"
+      else
+        echo "已创建: $file"
+      fi
+    done
+  fi
+}
+
+dry_run="false"
+force="false"
+json_output="false"
+target_dir=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      print_usage
+      exit 0
+      ;;
+    --dry-run)
+      dry_run="true"
+      ;;
+    --force)
+      force="true"
+      ;;
+    --json)
+      json_output="true"
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      emit_error "$EXIT_INVALID_USAGE" "未知参数: $1"
+      ;;
+    *)
+      if [[ -n "$target_dir" ]]; then
+        emit_error "$EXIT_INVALID_USAGE" "只允许一个目录参数: 已收到 $target_dir 和 $1"
+      fi
+      target_dir="$1"
+      ;;
+  esac
+  shift
+done
+
+if [[ $# -gt 0 ]]; then
+  emit_error "$EXIT_INVALID_USAGE" "存在多余参数: $*"
 fi
 
-target_dir="$1"
+if [[ -z "$target_dir" ]]; then
+  emit_error "$EXIT_INVALID_USAGE" "缺少目录参数，使用 --help 查看用法"
+fi
+
 target_dir="${target_dir%/}"
 
 if [[ -z "$target_dir" ]]; then
-  echo "目录不能为空"
-  exit 1
+  emit_error "$EXIT_INVALID_TARGET" "目录不能为空"
 fi
 
 folder_name="${target_dir:t}"
@@ -51,12 +157,27 @@ model_file="$target_dir/model.swift"
 service_file="$target_dir/service.swift"
 repository_file="$target_dir/repository.swift"
 
-for file in "$logic_file" "$state_file" "$view_file" "$model_file" "$service_file" "$repository_file"; do
+files=(
+  "$logic_file"
+  "$state_file"
+  "$view_file"
+  "$model_file"
+  "$service_file"
+  "$repository_file"
+)
+
+for file in "${files[@]}"; do
   if [[ -e "$file" ]]; then
-    echo "文件已存在: $file"
-    exit 1
+    if [[ "$force" != "true" ]]; then
+      emit_error "$EXIT_FILE_EXISTS" "文件已存在: $file（可用 --force 覆盖）"
+    fi
   fi
 done
+
+if [[ "$dry_run" == "true" ]]; then
+  emit_success "dry-run"
+  exit 0
+fi
 
 mkdir -p "$target_dir"
 
@@ -231,13 +352,9 @@ final class ${base_class_name}PageViewController: UIViewController {
     private func bootstrap() {
         Task { [weak self] in
             guard let self else { return }
-            do {
-                self.logic.onInit()
-                await self.logic.onReady()
-                self.render()
-            } catch {
-                self.showToast("初始化失败，请稍后重试")
-            }
+            self.logic.onInit()
+            await self.logic.onReady()
+            self.render()
         }
     }
 
@@ -259,9 +376,4 @@ final class ${base_class_name}PageViewController: UIViewController {
 }
 EOF
 
-echo "已创建: $logic_file"
-echo "已创建: $state_file"
-echo "已创建: $view_file"
-echo "已创建: $model_file"
-echo "已创建: $service_file"
-echo "已创建: $repository_file"
+emit_success "success"
